@@ -119,113 +119,13 @@ pub fn install_with_settings(settings: Settings) {
 // [Backtrace frame]                                                                              //
 // ============================================================================================== //
 
-struct Frame {
+pub struct Frame {
     name: Option<String>,
     lineno: Option<u32>,
     filename: Option<PathBuf>,
 }
 
 impl Frame {
-    /// Heuristically determine whether the frame is likely to be part of a
-    /// dependency.
-    ///
-    /// If it fails to detect some patterns in your code base, feel free to drop
-    /// an issue / a pull request!
-    fn is_dependency_code(&self) -> bool {
-        const SYM_PREFIXES: &[&str] = &[
-            "std::",
-            "core::",
-            "backtrace::backtrace::",
-            "_rust_begin_unwind",
-            "color_traceback::",
-            "__rust_",
-            "___rust_",
-            "__pthread",
-            "_main",
-            "main",
-            "__scrt_common_main_seh",
-            "BaseThreadInitThunk",
-            "_start",
-            "__libc_start_main",
-            "start_thread",
-        ];
-
-        // Inspect name.
-        if let Some(ref name) = self.name {
-            if SYM_PREFIXES.iter().any(|x| name.starts_with(x)) {
-                return true;
-            }
-        }
-
-        const FILE_PREFIXES: &[&str] = &[
-            "/rustc/",
-            "src/libstd/",
-            "src/libpanic_unwind/",
-            "src/libtest/",
-        ];
-
-        // Inspect filename.
-        if let Some(ref filename) = self.filename {
-            let filename = filename.to_string_lossy();
-            if FILE_PREFIXES.iter().any(|x| filename.starts_with(x))
-                || filename.contains("/.cargo/registry/src/")
-            {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Heuristically determine whether a frame is likely to be a post panic
-    /// frame.
-    ///
-    /// Post panic frames are frames of a functions called after the actual panic
-    /// is already in progress and don't contain any useful information for a
-    /// reader of the backtrace.
-    fn is_post_panic_code(&self) -> bool {
-        const SYM_PREFIXES: &[&str] = &[
-            "_rust_begin_unwind",
-            "core::result::unwrap_failed",
-            "core::panicking::panic_fmt",
-            "color_backtrace::create_panic_handler",
-            "std::panicking::begin_panic",
-            "begin_panic_fmt",
-            "failure::backtrace::Backtrace::new",
-            "backtrace::capture",
-            "failure::error_message::err_msg",
-            "<failure::error::Error as core::convert::From<F>>::from",
-        ];
-
-        match self.name.as_ref() {
-            Some(name) => SYM_PREFIXES.iter().any(|x| name.starts_with(x)),
-            None => false,
-        }
-    }
-
-    /// Heuristically determine whether a frame is likely to be part of language
-    /// runtime.
-    fn is_runtime_init_code(&self) -> bool {
-        const SYM_PREFIXES: &[&str] =
-            &["std::rt::lang_start::", "test::run_test::run_test_inner::"];
-
-        let (name, file) = match (self.name.as_ref(), self.filename.as_ref()) {
-            (Some(name), Some(filename)) => (name, filename.to_string_lossy()),
-            _ => return false,
-        };
-
-        if SYM_PREFIXES.iter().any(|x| name.starts_with(x)) {
-            return true;
-        }
-
-        // For Linux, this is the best rule for skipping test init I found.
-        if name == "{{closure}}" && file == "src/libtest/lib.rs" {
-            return true;
-        }
-
-        false
-    }
-
     fn print_source_if_avail(&self, s: &mut Settings) -> IOResult {
         let (lineno, filename) = match (self.lineno, self.filename.as_ref()) {
             (Some(a), Some(b)) => (a, b),
@@ -258,7 +158,7 @@ impl Frame {
     }
 
     fn print(&self, i: usize, s: &mut Settings) -> IOResult {
-        let is_dependency_code = self.is_dependency_code();
+        let is_dependency_code = s.filter.is_dep_code(self);
 
         // Print frame index.
         write!(s.out, "{:>2}: ", i)?;
@@ -317,6 +217,128 @@ impl Frame {
         }
 
         Ok(())
+    }
+}
+
+// ============================================================================================== //
+// [Filtering]                                                                                    //
+// ============================================================================================== //
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    /// The filter doesn't classify this frame.
+    Unclassified,
+    /// Pre panic frames are frames of functions that belong to the language runtime
+    /// or other program startup related code that doesn't contribute anything to
+    /// figuring out why code panicked.
+    PrePanic,
+    /// Post panic frames are frames of a functions called after the actual panic
+    /// is already in progress and don't contain any useful information for a
+    /// reader of the backtrace.
+    PostPanic,
+}
+
+pub trait FrameFilter {
+    /// Heuristically try to classify a frame for filtering.
+    fn classify(&self, _frame: &Frame) -> FrameKind {
+        FrameKind::Unclassified
+    }
+
+    /// Heuristically determine whether the frame is likely to be part of a dependency.
+    fn is_dep_code(&self, _frame: &Frame) -> bool {
+        false
+    }
+}
+
+/// The default filter, skipping Rust language init frames.
+#[derive(Debug, Default)]
+pub struct DefaultFilter;
+
+impl FrameFilter for DefaultFilter {
+    fn classify(&self, frame: &Frame) -> FrameKind {
+        // Post panic
+        static POST_PANIC_SYM_PREFIXES: &[&str] = &[
+            "_rust_begin_unwind",
+            "core::result::unwrap_failed",
+            "core::panicking::panic_fmt",
+            "color_backtrace::create_panic_handler",
+            "std::panicking::begin_panic",
+            "begin_panic_fmt",
+            "failure::backtrace::Backtrace::new",
+            "backtrace::capture",
+            "failure::error_message::err_msg",
+            "<failure::error::Error as core::convert::From<F>>::from",
+        ];
+
+        static PRE_PANIC_SYM_PREFIXES: &[&str] =
+            &["std::rt::lang_start::", "test::run_test::run_test_inner::"];
+
+        if let Some(name) = frame.name.as_ref() {
+            if POST_PANIC_SYM_PREFIXES.iter().any(|x| name.starts_with(x)) {
+                return FrameKind::PostPanic;
+            }
+
+            if let Some(fname) = frame.filename.as_ref() {
+                let fname = fname.to_string_lossy();
+
+                if PRE_PANIC_SYM_PREFIXES.iter().any(|x| name.starts_with(x)) {
+                    return FrameKind::PrePanic;
+                }
+
+                // For Linux, this is the best rule for skipping test init I found.
+                if name == "{{closure}}" && fname == "src/libtest/lib.rs" {
+                    return FrameKind::PrePanic;
+                }
+            }
+        }
+
+        FrameKind::Unclassified
+    }
+
+    fn is_dep_code(&self, frame: &Frame) -> bool {
+        static SYM_PREFIXES: &[&str] = &[
+            "std::",
+            "core::",
+            "backtrace::backtrace::",
+            "_rust_begin_unwind",
+            "color_traceback::",
+            "__rust_",
+            "___rust_",
+            "__pthread",
+            "_main",
+            "main",
+            "__scrt_common_main_seh",
+            "BaseThreadInitThunk",
+            "_start",
+            "__libc_start_main",
+            "start_thread",
+        ];
+
+        // Inspect name.
+        if let Some(ref name) = frame.name {
+            if SYM_PREFIXES.iter().any(|x| name.starts_with(x)) {
+                return true;
+            }
+        }
+
+        static FILE_PREFIXES: &[&str] = &[
+            "/rustc/",
+            "src/libstd/",
+            "src/libpanic_unwind/",
+            "src/libtest/",
+        ];
+
+        // Inspect filename.
+        if let Some(ref filename) = frame.filename {
+            let filename = filename.to_string_lossy();
+            if FILE_PREFIXES.iter().any(|x| filename.starts_with(x))
+                || filename.contains("/.cargo/registry/src/")
+            {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -381,6 +403,7 @@ pub struct Settings {
     verbosity: Verbosity,
     strip_function_hash: bool,
     colors: ColorScheme,
+    filter: Box<dyn FrameFilter + Send>,
 }
 
 impl Default for Settings {
@@ -395,6 +418,7 @@ impl Default for Settings {
             })),
             strip_function_hash: false,
             colors: ColorScheme::classic(),
+            filter: Box::new(DefaultFilter::default()),
         }
     }
 }
@@ -456,6 +480,12 @@ impl Settings {
         self.strip_function_hash = strip;
         self
     }
+
+    /// Overwrite the default frame filter.
+    pub fn filter(mut self, filter: Box<dyn FrameFilter + Send>) -> Self {
+        self.filter = filter;
+        self
+    }
 }
 
 // ============================================================================================== //
@@ -483,14 +513,14 @@ pub fn print_backtrace(trace: &backtrace::Backtrace, settings: &mut Settings) ->
     // Try to find where the interesting part starts...
     let top_cutoff = frames
         .iter()
-        .rposition(Frame::is_post_panic_code)
+        .rposition(|x| s.filter.classify(x) == FrameKind::PostPanic)
         .map(|x| x + 1)
         .unwrap_or(0);
 
     // Try to find where language init frames start ...
     let bottom_cutoff = frames
         .iter()
-        .position(Frame::is_runtime_init_code)
+        .position(|x| s.filter.classify(x) == FrameKind::PrePanic)
         .unwrap_or_else(|| frames.len());
 
     if top_cutoff != 0 {
