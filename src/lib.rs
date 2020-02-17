@@ -120,9 +120,9 @@ pub fn install_with_settings(settings: Settings) {
 // ============================================================================================== //
 
 pub struct Frame {
-    name: Option<String>,
-    lineno: Option<u32>,
-    filename: Option<PathBuf>,
+    pub name: Option<String>,
+    pub lineno: Option<u32>,
+    pub filename: Option<PathBuf>,
 }
 
 impl Frame {
